@@ -1,0 +1,44 @@
+v1.004
+- Améliorations du GPS :
+	- récupération des données plus fréquentes et plus efficaces
+	  version
+
+- Amélioration des modes :
+	- Positions globalement plus précises
+	- Mode zone : algorithme différent, pour anticiper les erreurs de
+	  positions GPS
+	- Don't move plus réactif (augmentation de la fréquence
+	  d'échantillonnage de l'accéléromètre)
+
+- Batterie :
+	- Gestion de la batterie uniquement avec le GSM
+	- Cohérence de la batterie : plus d'oscillations pour l'utilisateur
+	- Pourcentage plus fiable par rapport à la réalité
+
+- Autres :
+	- USV : retente tant que la donnée n'a pas été transmise
+	- Correction du bug pour lequel le RTC ne déclenchait pas certaines
+	  alarmes
+	- Changement des combinaisons de leds : allumage, réception de message
+	- Correction de problèmes provoquant des disfonctionnements généraux au sein du
+	  Seekios.
+	
+v1.005
+
+- Amélioration du GPS :
+	- Meilleure gestion des cycles de vie du GPS : allumage, extinction, "warm-up"
+
+- Amélioration des modes :
+	- Algorithme du mode zone changé, offrant une meilleure fiabilité de la détection de la sortie de zone
+	- Les modes tracking ne compensent plus les retards dans la récupération d'une position. Si un des modes tracking prend met trop de temps à récupérer une de positios, cette perte de temps n'aura pas d'impact sur la prochaine période de rafraîchissement
+	- Les modes tracking utilisent à présent l'accéléromètre pour détecter un changement de position, permettant une meilleure précision lorsque le seekios est immobile
+	
+- Batterie :
+	- Implémentation d'un état d'endormissement plus profond du seekios, améliorant légèrement l'autonomie de la balise
+	- Amélioration de l'échantillonnage de la batterie : le seekios ne renvoie plus un niveau de batterie correspondant à un pic de consommation
+	
+- Général :
+	- Fiabilité du processus de mise à jour améliorée
+	- Meilleure synchronisation balise - serveurs
+	- Correction de problèmes provoquant des disfonctionnements d'ordre général au sein du
+	  Seekios.

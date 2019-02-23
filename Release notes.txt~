@@ -1,0 +1,24 @@
+v1.004
+- Améliorations du GPS :
+	- récupération des données plus fréquentes et plus efficaces
+	  version
+
+- Amélioration des modes :
+	- Positions globalement plus précises
+	- Mode zone : algorithme différent, pour anticiper les erreurs de
+	  positions GPS
+	- Don't move plus sensible
+
+- Batterie :
+	- Gestion de la batterie uniquement avec le GSM
+	- Cohérence de la batterie : plus d'oscillations pour l'utilisateur
+	- Pourcentage plus fiable par rapport à la réalité
+
+- Autres :
+	- USV : retente tant que la donnée n'a pas été transmise
+	- Correction du bug pour lequel le RTC ne déclenchait pas certaines
+	  alarmes
+	- Changement des combinaisons de leds : allumage, réception de message
+	- Correction de provoquant des disfonctionnements généraux au sein du
+	  Seekios.
+	

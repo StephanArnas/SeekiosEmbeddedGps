@@ -1,0 +1,920 @@
+#include <seekiosManager/seekios_manager.h>
+
+static void init(void);
+static void handleOnDemandRequest(void);
+static void printEndMessage(void);
+static void handleGPSRequest(void);
+static void handleMotionDetection(void);
+static void handleOutputMessageRequest(void);
+static void handleRingIndicatorInterrupt(void);
+static void handlePowerOnGSMRequest(void);
+static void handleSosRequest(void);
+static void hibernateIfInactive(void);
+static void handleModeWakeUpCalendarInterrupt(void);
+static bool terminateRunningMode();
+static void turnOnSeekios(void);
+static void turnOffSeekios(void);
+static void	waitForTasksTermination(void);
+static void showBatteryLevel(void);
+static void handleBatteryValueRequest(void);
+static void handleHttpSessionVerificationRequest(void);
+static void handleHttpSessionExpiration(void);
+static void handleGPSUnused(void);
+static void handleGPSReused(void);
+static void handleGPSExpired(void);
+static void firstRunSeekios(void);
+static void terminateGPSUse(void);
+static void showNewModeStarting(E_MODE_STATUS newStatus);
+static void terminateGSMUse(void);
+static void handleUpdateCalendarProcessesUpdate(void);
+static void handleCheckNetworkStatusRequest(void);
+static void showChargeLevelIfUSBPlugged(void);
+static void handleCheckLPC(void);
+static void handleRunModeFromRC(void);
+static bool runMode(E_MODE_STATUS statusToRun, uint8_t statusStateToRun);
+static void updateHttpSessionExpirationPeriod(void);
+static void purgeMasks(void);
+static void restoreMasks(void);
+static void handleListenerRequest(void);
+
+static bool _allMaskClearedDoubleCheck;
+
+static size_t fh;
+static BaseType_t wm;
+
+static void init(){
+	seekiosManagerStarted = true;
+	dataflashManager_eraseUsedPages();
+	taskManagementUtilities_startButtonManagerTask();
+	taskManagementUtilities_startLedManagerTask();
+	bool isSeekiosFirstRun = seekiosInfoManager_isSeekiosFirstRun();
+	powerStateManager_init(isSeekiosFirstRun);
+
+	#if (SYSTEMATIC_POWER_ON_TESTS==0)
+	if(isSeekiosFirstRun)
+	{
+		firstRunSeekios();
+	}
+	#else
+	firstRunSeekios();
+	#endif
+	seekiosInfoManager_initSeekiosInfo();
+	ledUtilities_runSeekiosBootLedInstruction();
+	USARTManager_printUsbWait("--- SEEKIOS MANAGER STARTING ---\r\n");
+	_allMaskClearedDoubleCheck = false;
+}
+
+void task_seekiosManager(void* param){
+	UNUSED(param);
+	init();
+
+	while(1){
+		volatile EventBits_t requestMask		 = maskUtilities_getRequestMask();
+		volatile EventBits_t runningMask		 = maskUtilities_getRunningMask();
+		volatile EventBits_t interruptMask		 = maskUtilities_getInterruptMask();
+		volatile EventBits_t configuredAlarmMask = maskUtilities_getConfiguredAlarmMask();
+
+		batteryManager_updateLastSampledVoltages();
+
+		if(requestMask & REQUEST_BIT_CHECK_BATTERY_LEVEL){
+			handleBatteryValueRequest();
+		}
+
+		if(requestMask & REQUEST_BIT_SEEKIOS_TURN_OFF){
+			turnOffSeekios();
+		} else if(requestMask & REQUEST_BIT_SEEKIOS_TURN_ON){
+			turnOnSeekios();
+		}
+
+		if(powerStateManager_isSeekiosOn()){
+
+			if((requestMask & REQUEST_BIT_ON_DEMAND) && !(runningMask & RUNNING_BIT_ON_DEMAND)){
+				handleOnDemandRequest();
+			}
+
+			if(interruptMask & INTERRUPT_BIT_RING_INDICATOR)
+			{
+				handleRingIndicatorInterrupt();
+			}
+
+			if(((requestMask & REQUEST_BIT_LISTENER) || (requestMask & REQUEST_BIT_SENDER))
+			&& !((runningMask & RUNNING_BIT_LISTENER) || (runningMask & RUNNING_BIT_SENDER)))
+			{
+				if(requestMask & REQUEST_BIT_LISTENER){
+					handleListenerRequest();
+				}
+				else if(requestMask & REQUEST_BIT_SENDER)
+				{
+					handleOutputMessageRequest();
+				}
+			}
+			
+			if(!ModuleManager_isModuleStarted() && !(runningMask & RUNNING_BIT_MODULE_TASK)){
+				handlePowerOnGSMRequest();
+			}
+			
+			if(ModuleManager_isModuleStarted() && (requestMask & REQUEST_BIT_CHECK_NETWORK_STATUS) && !(runningMask & RUNNING_BIT_CHECK_NETWORK_STATUS))
+			{
+				handleCheckNetworkStatusRequest();
+			}
+
+			if(interruptMask & INTERRUPT_BIT_CALENDAR_MODE_WAKEUP){
+				handleModeWakeUpCalendarInterrupt();
+			}
+
+			// starts the GPS and the GPS manager
+			if( !GPSManager_isGPSOn()
+			&& maskUtilities_isGpsRequested()
+			&& !(runningMask & RUNNING_BIT_GPS_MANAGER)){
+				handleGPSRequest();
+			}
+			else if(GPSManager_isGPSOn() && !(runningMask & RUNNING_BIT_GPS_MANAGER))
+			{
+				if(maskUtilities_isGpsRequested()
+				&& GPSManager_isGPSExpirationAlarmScheduled()
+				&& !(requestMask & REQUEST_BIT_GPS_EXPIRED)){
+					handleGPSReused();
+				}
+				else if (!maskUtilities_isGpsRequested()
+				&& !GPSManager_isGPSExpirationAlarmScheduled()
+				&& !(requestMask & REQUEST_BIT_GPS_EXPIRED))
+				{
+					handleGPSUnused();
+				}
+				else if (requestMask & REQUEST_BIT_GPS_EXPIRED)
+				{
+					handleGPSExpired();
+				}
+			}
+
+			if(interruptMask & INTERRUPT_BIT_MOTION_DETECTED){
+				handleMotionDetection();
+			}
+
+			if(requestMask & REQUEST_BIT_START_MODE_FROM_LPC)
+			{
+				handleCheckLPC();
+			}
+			else if (requestMask & REQUEST_BIT_START_MODE_FROM_RC)
+			{
+				handleRunModeFromRC();
+			}
+			
+			if(maskUtilities_isHttpSessionRequested()
+			&& !(runningMask & RUNNING_BIT_HTTP_SESSION_TASK))
+			{
+				handleHttpSessionVerificationRequest();
+			}
+			else if ((requestMask & REQUEST_BIT_HTTP_SESSION_EXPIRED)
+			&& !(runningMask & RUNNING_BIT_HTTP_SESSION_TASK)
+			&& !maskUtilities_isHttpSessionRequested())
+			{
+				handleHttpSessionExpiration();
+			}
+
+			if(requestMask & REQUEST_BIT_BATTERY_LEDS){
+				showBatteryLevel();
+			}
+
+			if(requestMask & REQUEST_BIT_UPDATE_CALENDAR_PROCESSES)
+			{
+				handleUpdateCalendarProcessesUpdate();
+			}
+		} // if SeekiosOn
+
+		if((requestMask & REQUEST_BIT_SOS) && !(runningMask & RUNNING_BIT_SOS)){
+			if(powerSavingManager_isPowerSavingEnabled()){
+				powerSavingManager_disablePowerSaving();
+			}
+			if(!powerStateManager_isSeekiosOn()){
+				turnOnSeekios();
+			}
+			if(powerStateManager_isSeekiosOn()){
+				handleSosRequest();
+			}
+		}
+
+		if(requestMask & REQUEST_BIT_RESET){
+			NVIC_SystemReset();
+		}
+
+		if(requestMask & REQUEST_BIT_TEST_FUNCTIONALITIES){
+			//handleTestFunctionalitiesRequest(); // TODO : test and uncomment
+		}
+		
+		showChargeLevelIfUSBPlugged();
+
+		fh = xPortGetFreeHeapSize();
+		wm = uxTaskGetStackHighWaterMark(NULL);
+
+		if(maskUtilities_areAllMaskCleared() && !_allMaskClearedDoubleCheck){
+			_allMaskClearedDoubleCheck = true;
+			vTaskDelay(1000);
+			continue;
+		}
+		else if(!maskUtilities_areAllMaskCleared())
+		{
+			_allMaskClearedDoubleCheck = false;
+			vTaskDelay(1000);
+			continue;
+		}
+
+		// TODO : à décommenter
+		hibernateIfInactive();
+	}
+}
+
+/* When the USB is plugged, we : show the current charge level.
+We change the USB charge status every 30 seconds only : to avoid weird led showing when the battery is going up and down all the time
+This function is called by the seekiosManager every seconds, so the secondsCount is updating to 1 each time the function is called.*/
+static void showChargeLevelIfUSBPlugged()
+{
+	static secondsCount = 0;
+	//static E_BATTERY_PERCENTAGE_TIER lastShownTier;
+	static uint32_t currentlyRunningChargeLevelInstructionID = 0;
+	static uint32_t currentlyRunningChargeLevelPercentageTier = BATTERY_PERCENTAGE_TIER_NONE;
+	static bool isRefreshTime = false;
+
+	if(batteryManager_isUSBPlugged())
+	{
+		E_BATTERY_PERCENTAGE_TIER batteryPercentageTier = batteryManager_getBatteryPercentageTier();
+		secondsCount++;
+		if(secondsCount == 30)
+		{
+			isRefreshTime = true;
+			secondsCount = 0;
+		}
+
+		if(!LEDManager_isInstructionRunning(currentlyRunningChargeLevelInstructionID)
+		|| (batteryPercentageTier != currentlyRunningChargeLevelPercentageTier && isRefreshTime))
+		{
+			currentlyRunningChargeLevelInstructionID = ledUtilities_runBatteryChargeInstruction(batteryPercentageTier);
+			currentlyRunningChargeLevelPercentageTier = batteryPercentageTier;
+		}
+	}
+	else
+	{	
+		LEDManager_stopCurrentlyRunningInstructionId(currentlyRunningChargeLevelInstructionID);
+	}
+}
+
+/* This request is triggered once the Calendar is updated from the server.
+Once the calendar is updated from the server, this handle sets the alarms
+with the newly received calendar date */
+static void handleUpdateCalendarProcessesUpdate()
+{
+	maskUtilities_setRequestMaskBits(REQUEST_BIT_CHECK_BATTERY_LEVEL);
+	maskUtilities_setRequestMaskBits(REQUEST_BIT_CHECK_NETWORK_STATUS);
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_UPDATE_CALENDAR_PROCESSES);
+	// TODO : reconfigured already configured alarms with the new calendar value
+}
+
+static void handleTestFunctionalitiesRequest()
+{
+	turnOffSeekios();
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_TEST_FUNCTIONALITIES);
+	taskManagementUtilities_startFunctionalitiesTestAdmin();
+}
+
+static void handleHttpSessionVerificationRequest(){
+	updateHttpSessionExpirationPeriod();
+	taskManagementUtilities_startHttpSessionOpenerTask();
+}
+
+static void updateHttpSessionExpirationPeriod()
+{
+	ModeStatus seekiosStatus;
+	statusManager_getRunningStatus(&seekiosStatus);
+	uint16_t refreshRate = statusManager_getRunningRefreshRate();
+	httpManager_updateGPRSExpirationTime(seekiosStatus, refreshRate);
+}
+
+static void handleHttpSessionExpiration(){
+	USARTManager_printUsbWait("HTTP Session EXPIRED !\r\n");
+	taskManagementUtilities_startHttpSessionExpiredTask();
+}
+
+/* Checks if the battery level is critical. If yes, we try to turn the GSM on and send a message. */
+static void handleBatteryValueRequest(){
+	uint16_t batteryLevel = batteryManager_getLastSampledBatteryVoltage();
+	batteryManager_analyzeBatteryLevel(batteryLevel);
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_CHECK_BATTERY_LEVEL);
+}
+
+/* Shows to the user the level of the battery with the leds */
+static void showBatteryLevel(){
+	E_BATTERY_PERCENTAGE_TIER batteryPercentageTier = batteryManager_getBatteryPercentageTier();
+	ledUtilities_runBatteryLedInstruction(batteryPercentageTier);
+	maskUtilities_printRequestMask();
+	maskUtilities_printRunningMask();
+	maskUtilities_printInterruptMask();
+	maskUtilities_printConfiguredAlarmsMask();
+	USARTManager_printUsbWait("GSM : Started - Lastly checked network : ");
+	char buff[10];
+	csManager_getLastCheckNetwork(buff);
+	USARTManager_printUsbWait(buff);
+	USARTManager_printUsbWait("\r\n");
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_BATTERY_LEDS);
+	uint16_t voltages[2];
+	ADC_read_BAT_USB(voltages);
+	stringHelper_intToString(voltages[0], buff);
+	USARTManager_printUsbWait("Battery level : ");
+	USARTManager_printUsbWait(buff);
+	stringHelper_intToString(voltages[1], buff);
+	USARTManager_printUsbWait(" - USB Charge level : ");
+	USARTManager_printUsbWait(buff);
+	USARTManager_printUsbWait("\r\n");
+}
+
+static void turnOnSeekios(){
+	batteryManager_updateLastSampledVoltages();
+	if(!batteryManager_isBatteryLevelCritical())
+	{
+		restoreMasks();
+		USARTManager_printUsbWait("--- SEEKIOS POWERED ON---\r\n");
+		powerStateManager_setSeekiosOn();
+	}
+	else
+	{
+		ledUtilities_runTurnOffSeekiosLedInstruction();
+	}
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_SEEKIOS_TURN_ON);
+}
+
+static void turnOffSeekios(){
+	uint32_t turningOffInstructionId = ledUtilities_runCurrentlyTurningOffLedInstruction();
+	terminateRunningMode();
+	waitForTasksTermination();
+	terminateGPSUse();
+	terminateGSMUse();
+	LEDManager_stopCurrentlyRunningInstructionId(turningOffInstructionId);
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_SEEKIOS_TURN_OFF);
+	purgeMasks();
+	USARTManager_printUsbWait("--- SEEKIOS POWERED OFF---\r\n");
+	powerStateManager_setSeekiosOff();
+}
+
+/* Registers all the remaining pending actions that will have to be performed when the Seekios will wake up again, 
+and removes all of them from the interrupt, request and configured alarm masks
+When the Seekios wakes up again, it should call the function restoreMasks*/
+static void purgeMasks()
+{
+	volatile EventBits_t requestMask		 = maskUtilities_getRequestMask();
+	volatile EventBits_t runningMask		 = maskUtilities_getRunningMask();
+	volatile EventBits_t interruptMask		 = maskUtilities_getInterruptMask();
+	volatile EventBits_t configuredAlarmMask = maskUtilities_getConfiguredAlarmMask(); 
+
+
+	if(configuredAlarmMask & CONFIGURED_ALARM_BIT_LISTENER_RETRY
+	|| requestMask & REQUEST_BIT_LISTENER)
+	{		
+		USARTManager_printUsbWait("Storing PENDING_ACTION_BIT_LISTENER bit.\r\n");
+		messageListener_clearAlarmListenerRetryIfSet();
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_LISTENER);
+		powerStateManager_setPendingActionBits(PENDING_ACTION_BIT_LISTENER);
+	}
+
+	if(interruptMask & INTERRUPT_BIT_RING_INDICATOR)
+	{
+		USARTManager_printUsbWait("Storing PENDING_ACTION_BIT_RING_INDICATOR_INTERRUPT bit.\r\n");
+		maskUtilities_clearInterruptMaskBits(INTERRUPT_BIT_RING_INDICATOR);
+		powerStateManager_setPendingActionBits(PENDING_ACTION_BIT_RING_INDICATOR_INTERRUPT);
+	}
+
+	if(requestMask & REQUEST_BIT_SENDER
+	|| configuredAlarmMask & CONFIGURED_ALARM_BIT_SENDER_RETRY)
+	{
+		USARTManager_printUsbWait("Storing PENDING_ACTION_BIT_SENDER bit.\r\n");
+		messageSender_clearAlarmSenderRetry();
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_SENDER);
+		powerStateManager_setPendingActionBits(PENDING_ACTION_BIT_SENDER);
+	}
+
+	if(requestMask & REQUEST_BIT_START_MODE_FROM_LPC)
+	{
+		USARTManager_printUsbWait("Storing PENDING_ACTION_BIT_CHECK_LPC bit.\r\n");
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+		powerStateManager_setPendingActionBits(PENDING_ACTION_BIT_CHECK_LPC);
+	}
+
+// 	maskUtilities_clearRequestMask();
+// 	maskUtilities_clearInterruptMask();
+// 	maskUtilities_clearRunningMask();
+}
+
+/* Restores the masks that were purged with the function purgeMasks */
+static void restoreMasks()
+{
+	volatile EventBits_t pendingActionsMask = powerStateManager_getPendingActionMask();
+
+	if(pendingActionsMask & PENDING_ACTION_BIT_CHECK_LPC)
+	{
+		USARTManager_printUsbWait("Restoring PENDING_ACTION_BIT_CHECK_LPC bit.\r\n");
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+	}
+	else
+	{
+		USARTManager_printUsbWait("Restoring REQUEST_BIT_START_MODE_FROM_RC bit.\r\n");
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_RC);
+	}
+
+	if(pendingActionsMask & PENDING_ACTION_BIT_LISTENER)
+	{
+		USARTManager_printUsbWait("Restoring REQUEST_BIT_LISTENER bit.\r\n");
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_LISTENER);
+	}
+
+	if(pendingActionsMask & PENDING_ACTION_BIT_RING_INDICATOR_INTERRUPT)
+	{
+		USARTManager_printUsbWait("Restoring INTERRUPT_BIT_SMS_WAKE_UP bit.\r\n");
+		maskUtilities_setInterruptMaskBits(INTERRUPT_BIT_RING_INDICATOR);
+	}
+
+	if(pendingActionsMask & PENDING_ACTION_BIT_SENDER)
+	{
+		USARTManager_printUsbWait("Restoring REQUEST_BIT_SENDER bit.\r\n");
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_SENDER);
+	}
+
+	powerStateManager_clearPendingActionsMask();
+}
+
+/* Terminates the GSM And all activity related to it (suppressing bits that could have been set at a bad timming) */
+static void terminateGSMUse()
+{
+	// Remove alarms linked to the GSM use
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_HTTP_SESSION_EXPIRED);
+	httpManager_removeHttpSessionExpirationAlarm();
+	httpManager_removeHttpSessionRetryAlarm();
+	csManager_removeNetworkCheckAlarm();
+
+
+	if(ModuleManager_isModuleStarted())
+	{
+		csManager_detachNetworkService(VERY_LONG_WAIT);
+		httpManager_stopHTTP();
+		ModuleManager_powerOffModule();
+	}
+	// TODO : clear http mask, because module is powered off so event if the "correct" stopping failed (httpManager_stopHTTP), everything is stopped
+}
+
+/* Terminates the GPS and all activity related to it */
+static void terminateGPSUse()
+{
+	GPSManager_powerOffGPS();
+	GPSManager_removeGPSExpirationAlarm();
+}
+
+/* Attend la fin de l'exécution des tâches SOS, ON DEMAND, GSM powering on Sender, Http Session Task, Listener, GPS Manager, SOS*/
+static void	waitForTasksTermination(){
+	while(!maskUtilities_isRunningBitCleared(
+	RUNNING_BIT_ON_DEMAND\
+	| RUNNING_BIT_LISTENER\
+	| RUNNING_BIT_SENDER\
+	| RUNNING_BIT_SOS\
+	| RUNNING_BIT_MODULE_TASK\
+	| RUNNING_BIT_MODE\
+	| RUNNING_BIT_GPS_MANAGER\
+	| RUNNING_BIT_BUTTON_ACTION\
+	| RUNNING_BIT_HTTP_SESSION_TASK\
+	| RUNNING_BIT_CHECK_NETWORK_STATUS\
+	));
+}
+
+static void hibernateIfInactive(){
+	if(maskUtilities_areAllMaskCleared() && !(powerSavingManager_isPowerSavingEnabled() && ModuleManager_isModuleStarted())){ // TODO : la condition sur le power saving pourrait être remplacée par une alarm
+		while(maskUtilities_areAllMaskCleared())
+		{
+			USARTManager_printUsbWait("HIBERNATION...\r\n");
+			seekiosManager_hibernate();
+			vTaskDelay(200);
+		}
+		USARTManager_printUsbWait("SEEKIOS WAKE FROM HIBERNATION !\r\n");
+	}
+}
+
+/*
+This function enters the MCU in deep sleep/hibernation state, deactivating many MCU functionnalities
+*/
+void seekiosManager_hibernate(){
+
+	#if (DEEPER_SLEEP_ACTIVATED==1)
+
+	/*Disable Flash*/
+	DF_PowerDown();
+
+	/* Disable USART/SPI */
+	NVIC_DisableIRQ(SERCOM3_IRQn);
+	spi_m_sync_disable(&SER5_SPI_IMU_FLASH);
+	usart_async_disable(&SER1_GPS);
+	usart_async_disable(&SER2_GSM);
+	usart_sync_disable(&SER3_DEBUG); // Disable triggers bug when going out of hibernation ?
+	usart_async_disable(&BLE_UART);
+	usart_async_disable(&BLE_FC_UART);
+
+	/* SPI-sleep-level */
+	gpio_set_pin_function(PB03, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PB03, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PB03, GPIO_PULL_UP);
+	//
+	gpio_set_pin_function(PB00, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PB00, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PB00, GPIO_PULL_UP);
+	//
+	gpio_set_pin_function(PB01, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PB01, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PB01, GPIO_PULL_UP);
+
+	// Disable GPIO CS DATAFLASH
+	gpio_set_pin_function(PB30, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PB30, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PB30, GPIO_PULL_UP);
+	// Disable GPIO CS IMU
+	gpio_set_pin_function(PB31, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PB31, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PB31, GPIO_PULL_UP);
+
+	/* Serial sleep level */
+	// GSM (SERCOM 2)
+	gpio_set_pin_function(PA08, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PA08, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PA08, GPIO_PULL_DOWN);
+	
+	gpio_set_pin_function(PA09, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PA09, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PA09, GPIO_PULL_DOWN);
+
+	//GPS (SERCOM 1)
+	gpio_set_pin_function(PA17, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PA17, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PA17, GPIO_PULL_DOWN);
+	
+	gpio_set_pin_function(PA18, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PA18, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PA18, GPIO_PULL_DOWN);
+	
+	//DEBUG (SERCOM 3)
+	gpio_set_pin_function(PA22, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PA22, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PA22, GPIO_PULL_DOWN);
+	
+	gpio_set_pin_function(PA21, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_direction(PA21, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(PA21, GPIO_PULL_DOWN);
+
+
+	// Switch to buck regulator
+	SUPC->VREG.bit.SEL = 1;
+	MCLK->CPUDIV.reg = 0x40;
+	//nLDO/Buck : Select Buck
+	SUPC->VREG.bit.SEL = 1;
+	while(SUPC->STATUS.bit.VREGRDY==0);
+
+	#endif
+
+	/* Disable the Systick interrupt */
+	bool countFlag = ((SysTick_Type *)SysTick)->CTRL & SysTick_CTRL_COUNTFLAG_Msk;
+	((SysTick_Type *)SysTick)->CTRL &= ~SysTick_CTRL_ENABLE_Msk;
+
+	#if (WDT_ACTIVATED==1)
+	/* Disable Watchdog Timer */
+	WDTManager_turnOffWDT();
+	#endif
+
+	/* ### ENTERING SLEEP MODE ### */
+	sleep(4);
+
+	#if (WDT_ACTIVATED==1)
+	/* Re-enable Watchdog Timer */
+	WDTManager_turnOnWDT();
+	#endif
+	
+	/* Re-enable the Systick interrupt */
+	((SysTick_Type *)SysTick)->CTRL |= SysTick_CTRL_ENABLE_Msk;
+	if(countFlag) ((SysTick_Type *)SysTick)->CTRL |= SysTick_CTRL_COUNTFLAG_Msk;
+
+	#if (DEEPER_SLEEP_ACTIVATED==1)
+
+	/* Re-Enable USARTs & Interrupts */
+	NVIC_EnableIRQ(SERCOM3_IRQn);
+	NVIC_EnableIRQ(RTC_IRQn);
+	MCLK->CPUDIV.reg = 0x01;
+
+	// GPIO on CS Dataflash	output
+	gpio_set_pin_direction(DATAFLASH_CS, GPIO_DIRECTION_OUT);
+	gpio_set_pin_level(DATAFLASH_CS,true);
+	gpio_set_pin_function(DATAFLASH_CS, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_pull_mode(DATAFLASH_CS, GPIO_PULL_OFF);
+	// GPIO on CS Motion detector BMA222 output
+	gpio_set_pin_direction(IMU_CS, GPIO_DIRECTION_OUT);
+	gpio_set_pin_level(IMU_CS,true);
+	gpio_set_pin_function(IMU_CS, GPIO_PIN_FUNCTION_OFF);
+	gpio_set_pin_pull_mode(IMU_CS, GPIO_PULL_OFF);
+
+	SER5_SPI_IMU_FLASH_PORT_init();
+	SER1_GPS_PORT_init();
+	SER2_GSM_PORT_init();
+	SER3_DEBUG_PORT_init();
+	BLE_UART_PORT_init();
+	BLE_FC_UART_PORT_init();
+	spi_m_sync_enable(&SER5_SPI_IMU_FLASH);
+	usart_async_enable(&SER1_GPS);
+	usart_async_enable(&SER2_GSM);
+	usart_sync_enable(&SER3_DEBUG);
+	usart_async_enable(&BLE_UART);
+	usart_async_enable(&BLE_FC_UART);
+
+	#endif
+
+	vTaskDelay(1000);
+}
+
+static void handleModeWakeUpCalendarInterrupt(){
+	ModeStatus runningStatus;
+	statusManager_getRunningStatus(&runningStatus);
+
+	if(runningStatus.status == MODE_STATUS_TRACKING)
+	{
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_RC);
+	}
+
+	if(runningStatus.status == MODE_STATUS_ZONE)
+	{
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_RC);
+	}
+
+	maskUtilities_clearInterruptMaskBits(INTERRUPT_BIT_CALENDAR_MODE_WAKEUP);
+}
+
+static void handleOnDemandRequest(){
+	if(taskManagementUtilities_startOnDemandTask() == pdPASS){
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_ON_DEMAND);
+	}
+}
+
+static void handleSosRequest(){
+	if(taskManagementUtilities_startSOSTask() == pdPASS){
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_SOS);
+	}
+}
+
+static void handleMotionDetection(){
+
+	ModeStatus runningStatus;
+	statusManager_getRunningStatus(&runningStatus);
+	if(runningStatus.status == MODE_STATUS_DONT_MOVE && runningStatus.state == DONT_MOVE_STATE_RAS){
+		statusManager_setRunningConfigStatusState(DONT_MOVE_STATE_MOTION_WATCHING);
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_RC);
+	}
+	maskUtilities_clearInterruptMaskBits(INTERRUPT_BIT_MOTION_DETECTED);
+}
+
+static void handleGPSRequest(){
+	if(taskManagementUtilities_startGPSTask() == pdPASS){
+		#if (FAKE_POSITIONS_ACTIVATED==1)
+		taskManagementUtilities_startFakeNMEAFramesGenerator();
+		#endif
+		GPSManager_powerOnGPS();
+	}
+}
+
+/* While the GPS manager stops itself because there is no GPS needs,
+we set an alarm to wake up the seekios and determine that it has expired */
+static void handleGPSUnused(){
+	GPSManager_scheduleGPSExpirationAlarm();
+}
+
+static void handleGPSReused(){
+	GPSManager_removeGPSExpirationAlarm();
+	taskManagementUtilities_startGPSTask();
+}
+
+static void handleGPSExpired(){
+	USARTManager_printUsbWait("GPS Expired !\r\n");
+	#if (FAKE_POSITIONS_ACTIVATED==1)
+	if(!maskUtilities_isRunningBitCleared(RUNNING_BIT_FAKE_NMEA_GENERATOR))
+	{
+		taskManagementUtilities_stopFakeNMEAFramesGenerator();
+		maskUtilities_clearRunningMaskBits(RUNNING_BIT_FAKE_NMEA_GENERATOR);
+	}
+	#endif
+	GPSManager_powerOffGPS();
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_GPS_EXPIRED);
+}
+
+static void handleOutputMessageRequest(){
+	if(taskManagementUtilities_startSenderTask()==pdPASS){}
+}
+
+static void handleListenerRequest()
+{
+	if(taskManagementUtilities_startListenerTask() != pdPASS)
+	{
+		USARTManager_printUsbWait("Failure creating listener task....\r\n");
+		UBaseType_t wm = xPortGetFreeHeapSize();
+		USARTManager_printUsbWait("Remaining HEAP : ");
+		char heapBuf[10];
+		stringHelper_intToString(wm, heapBuf);
+		USARTManager_printUsbWait(heapBuf);
+		USARTManager_printUsbWait("\r\n");
+	}
+}
+
+static void handleRingIndicatorInterrupt()
+{
+	taskManagementUtilities_startRingInterruptTask();
+}
+
+static void handlePowerOnGSMRequest(){
+	taskManagementUtilities_startPowerOnModuleTask();
+}
+
+static void handleCheckNetworkStatusRequest()
+{
+	taskManagementUtilities_startCheckNetworkStatusTask();
+}
+
+static void showNewModeStarting(E_MODE_STATUS newStatus)
+{
+	switch(newStatus)
+	{
+		case MODE_STATUS_DONT_MOVE:
+		USARTManager_printUsbWait("-=[ START DONT MOVE ]=-\r\n");
+		break;
+		case MODE_STATUS_TRACKING:
+		USARTManager_printUsbWait("-=[ START TRACKING ]=-\r\n");
+		break;
+		case MODE_STATUS_WAITING:
+		USARTManager_printUsbWait("-=[ START WAITING ]=-\r\n");
+		break;
+		case MODE_STATUS_ZONE:
+		USARTManager_printUsbWait("-=[ START ZONE ]=-\r\n");
+		break;
+		default:
+		USARTManager_printUsbWait("-=[ UNKNOWN MODE STARTING ]=-\r\n");
+		break;
+	}
+	if(newStatus == MODE_STATUS_DONT_MOVE
+			|| newStatus == MODE_STATUS_TRACKING
+			|| newStatus == MODE_STATUS_ZONE)
+	{
+		ledUtilities_enterModeLedInstruction();
+	}
+}
+
+static void handleCheckLPC()
+{
+	if(statusManager_isLastParsedModeNew() || statusManager_isModeCanceled())
+	{
+		ModeStatus lastParsedSeekiosStatus;
+		statusManager_getLastParsedStatus(&lastParsedSeekiosStatus);
+		if(terminateRunningMode()){
+			ledUtilities_exitModeLedInstruction();
+			printEndMessage();
+		}
+		showNewModeStarting(lastParsedSeekiosStatus.status);
+		statusManager_initRunningMode();
+		runMode(lastParsedSeekiosStatus.status, lastParsedSeekiosStatus.state);
+	}
+	else
+	{
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+	}
+}
+
+static void handleRunModeFromRC()
+{
+	ModeStatus runningStatus;
+	statusManager_getRunningStatus(&runningStatus);
+	runMode(runningStatus.status, runningStatus.state);
+}
+
+static bool runMode(E_MODE_STATUS statusToRun, uint8_t statusStateToRun)
+{
+	/* The runModeTask boolean will be true if we have to either start a new mode (from the last parsed config, can be NONE/WAITING too)
+	either start a task of a running mode */
+	
+	bool runSuccess = true;
+
+	if(powerStateManager_isSeekiosOn())
+	{
+		if(statusToRun == MODE_STATUS_TRACKING)
+		{
+			if(taskManagementUtilities_startTrackingModeTask() == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY)
+			{
+				runSuccess = false;
+			}
+		}
+		else if(statusToRun == MODE_STATUS_ZONE)
+		{
+			if(taskManagementUtilities_startZoneModeTask() == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY)
+			{
+				runSuccess = false;
+			}
+		}
+		else if(statusToRun == MODE_STATUS_DONT_MOVE)
+		{
+			if(statusStateToRun == DONT_MOVE_STATE_RAS){
+				if(maskUtilities_useLastParsedConfig())
+				{
+					IMUManager_powerModeLowPower();
+					IMUManager_startSlopeDetection();
+				}
+				else if(maskUtilities_useRunningConfig())
+				{	
+					IMUManager_powerModeLowPower();
+					IMUManager_startSlopeDetection();
+				}
+			}
+			else if (statusStateToRun == DONT_MOVE_STATE_MOTION_WATCHING)
+			{
+				if(taskManagementUtilities_startDontMoveModeMotionDetectedTask() == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY)
+				{
+					runSuccess = false;
+				}
+			}
+			else if (statusStateToRun == DONT_MOVE_STATE_TRACKING)
+			{
+				if(taskManagementUtilities_startDontMoveModeMotionDetectedTask() == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY)
+				{
+					runSuccess = false;
+				}
+			}
+		}
+	}
+
+	if(runSuccess)
+	{
+		statusManager_setRunningConfigAndClearRequestModeConfigBits();
+	}
+}
+
+/* Terminates the currently running mode : deletes the FreeRTOS task, removes the alarms
+Returns true if a mode was stopped, false if there was no mode actually */
+static bool terminateRunningMode(){
+	
+	ModeStatus runningStatus;
+	statusManager_getRunningStatus(&runningStatus);
+
+	if(runningStatus.status == MODE_STATUS_NONE)
+	{
+		return false;
+	}
+
+	EventBits_t configuredAlarmMask = maskUtilities_getConfiguredAlarmMask();
+	EventBits_t runningMask = maskUtilities_getRunningMask();
+
+	if(configuredAlarmMask & CONFIGURED_ALARM_BIT_MODE_WAKEUP
+	|| runningMask & RUNNING_BIT_MODE){
+		if((runningMask & RUNNING_BIT_MODE)){
+			taskManagementUtilities_terminateRunningTaskMode();
+		}
+		if(configuredAlarmMask & CONFIGURED_ALARM_BIT_MODE_WAKEUP)
+		{
+			modesToolkit_removeWakeUpAlarm();
+		}
+	}
+
+	#if (BLE_ACTIVATED==1)
+	BLEManager_cancelBleUse();
+	#endif
+
+	maskUtilities_clearRunningMaskBits(RUNNING_BIT_MODE);
+	maskUtilities_clearRequestMaskBits(REQUEST_BIT_GPS_MODE);
+	IMUManager_stopSlopeDetection();
+	IMUManager_suspend();
+	return true;
+}
+
+static void printEndMessage(){
+	char message[32];
+	strcpy(message, "-=[ END ON ");
+	ModeStatus runningStatus;
+	statusManager_getRunningStatus(&runningStatus);
+	switch(runningStatus.status){
+		case MODE_STATUS_TRACKING:
+		strcat(message, "TRACKING ]=-\r\n");
+		break;
+		case MODE_STATUS_ZONE:
+		strcat(message, "ZONE ]=-\r\n");
+		break;
+		case MODE_STATUS_DONT_MOVE:
+		strcat(message, "DONT MOVE ]=-\r\n");
+		break;
+		default:
+		strcat(message,"NONE ]=-\r\n");
+	}
+	USARTManager_printUsbWait(message);
+}
+
+static void firstRunSeekios(){
+	taskManagementUtilities_startFunctionalitiesTestProduction();
+	vTaskDelay(1000);
+	EventBits_t runningMask = maskUtilities_getRunningMask();
+	do
+	{
+		runningMask  = maskUtilities_getRunningMask();
+		vTaskDelay(100);
+	} while (runningMask & RUNNING_BIT_TEST_FUNCTIONALITIES);
+	seekiosInfoManager_setSeekiosNotFirstRun();
+}

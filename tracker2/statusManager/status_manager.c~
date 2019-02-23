@@ -1,0 +1,539 @@
+#include <statusManager/status_manager.h>
+
+static void initParameter(ModeParameters* parameter);
+static void copyConfig(ModeConfig* dest, ModeConfig* src);
+static void buildLastParsedParameters(char *parameterStr, E_MODE_STATUS status);
+static int messageParser(E_MODE_STATUS status, char* message);
+static char* isolateMessageParameters(char* message);
+static E_MODE_STATUS parseSeekiosStatus(char* message);
+
+static ModeConfig _lastParsedConfig;	// the last parsed config we received
+static ModeConfig _runningConfig;		// the currently running config
+
+static SemaphoreHandle_t _lastParsedConfigSemaphore;
+static SemaphoreHandle_t _runningConfigSemaphore;
+
+void statusManager_initStatusManager(){
+	_lastParsedConfig.modeStatus.status= MODE_STATUS_WAITING;
+	_lastParsedConfig.modeStatus.state = 0;
+	initParameter(&(_lastParsedConfig.modeParameters));
+	
+	statusManager_initRunningConfig();
+
+	_lastParsedConfigSemaphore = xSemaphoreCreateRecursiveMutex();
+	_runningConfigSemaphore = xSemaphoreCreateRecursiveMutex();
+}
+
+void statusManager_initRunningConfig(){
+	_runningConfig.modeStatus.status= MODE_STATUS_NONE;
+	_runningConfig.modeStatus.state = 0;
+	initParameter(&(_runningConfig.modeParameters));
+}
+
+void statusManager_getLastParsedStatus(ModeStatus* seekiosStatus){
+	seekiosStatus->status = MODE_STATUS_NONE;
+	seekiosStatus->state	= 0;
+	if(xSemaphoreTakeRecursive(_lastParsedConfigSemaphore, LONG_WAIT)==pdPASS)
+	{
+		seekiosStatus->status = _lastParsedConfig.modeStatus.status;
+		seekiosStatus->state = _lastParsedConfig.modeStatus.state;
+		xSemaphoreGiveRecursive(_lastParsedConfigSemaphore);
+	}
+}
+
+uint8_t statusManager_getLastParsedStatusState(){
+	uint8_t state = 0;
+	if(xSemaphoreTakeRecursive(_lastParsedConfigSemaphore, LONG_WAIT)==pdPASS)
+	{
+		state = _lastParsedConfig.modeStatus.state;
+		xSemaphoreGiveRecursive(_lastParsedConfigSemaphore);
+	}
+
+	return state;
+}
+
+void statusManager_getRunningStatus(ModeStatus* seekiosStatus){
+	seekiosStatus->status = MODE_STATUS_NONE;
+	seekiosStatus->state	= 0;
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, LONG_WAIT)==pdPASS)
+	{
+		seekiosStatus->status = _runningConfig.modeStatus.status;
+		seekiosStatus->state = _runningConfig.modeStatus.state;
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+}
+
+uint8_t statusManager_getRunningStatusState(){
+	uint8_t state = 0; 
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, LONG_WAIT)==pdPASS)
+	{
+		state = _runningConfig.modeStatus.state;
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+	return state;
+}
+
+uint16_t statusManager_getRunningRefreshRate(){
+	uint16_t refreshRate = 1;
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, LONG_WAIT)==pdPASS)
+	{
+		refreshRate = _runningConfig.modeParameters.refreshRate;
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+	return refreshRate;
+}
+
+/* Stores the coordinates of the running config in the array passed as parameters
+and returns the number of coordinates copied */
+uint8_t statusManager_getRunningConfigCoordinates(Coordinate coordinates[NB_MAX_COORDINATES]){
+	uint8_t nbCoordinates = 0;
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, LONG_WAIT)==pdPASS)
+	{
+		memcpy(coordinates, _runningConfig.modeParameters.coordinates, sizeof(Coordinate)*NB_MAX_COORDINATES);
+		nbCoordinates = _runningConfig.modeParameters.nbCoordinates;
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+	return nbCoordinates;
+}
+
+
+static void initParameter(ModeParameters* parameter){
+	uint8_t i = 0;
+	parameter->refreshRate = 0;
+	parameter->nbCoordinates = 0;
+	parameter->modeID = 0;
+	parameter->useExtraOptions = 0;
+	for (i = 0; i < NB_MAX_COORDINATES; i++)
+	{
+		parameter->coordinates[i].lat = 0.0;
+		parameter->coordinates[i].lon = 0.0;
+	}
+}
+
+void statusManager_setRunningConfig(ModeConfig* configPtr){
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, (TickType_t) 1000) == pdTRUE)
+	{
+		copyConfig(&_runningConfig, configPtr);
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+}
+
+void statusManager_setRunningConfigStatusState(uint8_t state){
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, (TickType_t) 1000) == pdTRUE)
+	{
+		_runningConfig.modeStatus.state = state;
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+}
+
+void statusManager_getRunningConfig(ModeConfig* configPtr){
+	if(xSemaphoreTakeRecursive(_runningConfigSemaphore, (TickType_t) 1000) == pdTRUE)
+	{
+		copyConfig(configPtr, &_runningConfig);
+		xSemaphoreGiveRecursive(_runningConfigSemaphore);
+	}
+}
+
+/* Takes the values of the lastParsedConfig and use it as the runningConfig */
+void statusManager_useLastParsedConfigAsRunningConfig(){
+	if(xSemaphoreTakeRecursive( _lastParsedConfigSemaphore, ( TickType_t ) 1000 ) == pdTRUE)
+	{
+		statusManager_setRunningConfig(&_lastParsedConfig);
+		xSemaphoreGiveRecursive(_lastParsedConfigSemaphore);
+	}
+}
+
+/* Clears the request mode bits, and sets the running config as the last parsed config if necessary */
+void statusManager_setRunningConfigAndClearRequestModeConfigBits()
+{
+	if(maskUtilities_useLastParsedConfig())
+	{
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+		statusManager_useLastParsedConfigAsRunningConfig();
+	}
+	else
+	{
+		maskUtilities_clearRequestMaskBits(REQUEST_BIT_START_MODE_FROM_RC);
+	}
+}
+
+/* Copie les valeurs de la last parsed config dans une struct passée en paramètre */
+void statusManager_getLastParsedConfig(ModeConfig* destPtr){
+	if(xSemaphoreTakeRecursive( _lastParsedConfigSemaphore, ( TickType_t ) 1000 ) == pdTRUE ){
+		copyConfig(destPtr,&_lastParsedConfig);
+		xSemaphoreGiveRecursive(_lastParsedConfigSemaphore);
+	}
+}
+
+static void copyConfig(ModeConfig* dest, ModeConfig* src){
+	dest->modeParameters.refreshRate = src->modeParameters.refreshRate;
+	dest->modeStatus = src->modeStatus;
+	dest->modeParameters.refreshRate = src->modeParameters.refreshRate;
+	dest->modeStatus.state = src->modeStatus.state;
+	memcpy(dest->modeParameters.coordinates,src->modeParameters.coordinates,NB_MAX_COORDINATES*sizeof(Coordinate));
+	dest->modeParameters.nbCoordinates = src->modeParameters.nbCoordinates;
+}
+
+/* Met à jour les paramètres et les statuts du last parsed config et anciens en fonction
+d'un message passé en paramètre */
+void statusManager_updateLastParsedConfigFromMessage(char* message)
+{
+	E_MODE_STATUS parsedStatus = parseSeekiosStatus(message);
+	if(	parsedStatus != MODE_STATUS_NONE
+	&& (xSemaphoreTakeRecursive( _lastParsedConfigSemaphore, ( TickType_t ) 1000 ) == pdTRUE)
+	)
+	{
+		if(xSemaphoreTakeRecursive( _runningConfigSemaphore, ( TickType_t ) 1000 ) == pdTRUE)
+		{
+			if(parsedStatus == MODE_STATUS_ON_DEMAND){
+				maskUtilities_setRequestMaskBits(REQUEST_BIT_ON_DEMAND);
+			}
+			else
+			{
+				if(statusManager_isModeMessage(message))	{
+					_lastParsedConfig.modeStatus.status= parsedStatus;
+					initParameter(&(_lastParsedConfig.modeParameters));
+					messageParser(_lastParsedConfig.modeStatus.status, message);
+					maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+				}
+				else if(statusManager_isStateChangeMessage(message) && _runningConfig.modeStatus.status == parsedStatus) {
+					copyConfig(&_lastParsedConfig, &_runningConfig);
+					message = isolateMessageParameters(message);
+					_lastParsedConfig.modeStatus.state = atoi(message);
+					maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+				}
+			}
+			xSemaphoreGiveRecursive(_runningConfigSemaphore);
+		}
+		xSemaphoreGiveRecursive(_lastParsedConfigSemaphore);
+	}
+}
+
+/* Parse une string pour en tirer le statut actuel du seekios */
+static E_MODE_STATUS parseSeekiosStatus(char *message)
+{
+	if(!statusManager_isModeMessage(message) && !statusManager_isStateChangeMessage(message))	return MODE_STATUS_NONE;
+	
+	char statusSubstring[2];
+	statusSubstring[0] = message[2];
+	statusSubstring[1] = message[3];
+	
+	if (strstr(statusSubstring,"01"))	return MODE_STATUS_WAITING;
+	if (strstr(statusSubstring,"02"))	return MODE_STATUS_ON_DEMAND;
+	if (strstr(statusSubstring,"03"))	return MODE_STATUS_TRACKING;
+	if (strstr(statusSubstring,"04"))	return MODE_STATUS_DONT_MOVE;
+	if (strstr(statusSubstring,"05"))	return MODE_STATUS_ZONE;
+	if (strstr(statusSubstring,"08"))	return -1;
+	
+	return MODE_STATUS_NONE;
+}
+
+void statusManager_parsePowerSavingMessage(char* message){
+	//format du message : #P[isActive]([horaire])&
+	//exemples : #P115&, #P18&, #P1&, #P0&
+	char* parameters;
+	bool isActive;
+	uint8_t hourOfDay;
+	uint16_t messageLength;
+	isActive = false;
+	hourOfDay = 0;
+	
+	messageLength = strlen(message);
+	message[messageLength-1] = '\0';
+	parameters = message + 2;
+	
+	if(parameters[0] == 49)	isActive = true;
+	parameters++;
+	if(strlen(parameters) > 0)	hourOfDay = atoi(parameters);
+	
+	if(isActive){
+		powerSavingManager_enablePowerSaving(hourOfDay);
+	}
+	else{
+		powerSavingManager_disablePowerSaving();
+	}
+}
+
+// TODO : define the different Admin messages
+// A01 corresponds to the full-functionalities tests
+void statusManager_parseAdminMessage(char* message){
+	char msgNumStr[3];
+	msgNumStr[0] = message[2];
+	msgNumStr[1] = message[3];
+	msgNumStr[2] = 0;
+	uint8_t msgNum = atoi(msgNumStr);
+
+	switch(msgNum){
+		case 1:
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_TEST_FUNCTIONALITIES);
+		break;
+		default:
+		break;
+	}
+}
+
+/*
+parse les messages liés aux changements de configuration du seekios
+*/
+static int messageParser(E_MODE_STATUS status, char* message)
+{
+	// message had wrong format
+	if(!statusManager_isModeMessage(message)) return 0;
+	
+	message = isolateMessageParameters(message);
+	
+	// at this point, if strlen(message) = 0, It means that it doesn't have at least the ID of the mode.
+	if(strlen(message) == 0) return FUNCTION_FAILURE;
+	
+	buildLastParsedParameters(message, status);
+	return FUNCTION_SUCCESS;
+}
+
+/* Isole le contenu du message en enlevant le #M0X (ou #S0X) et le & */
+static char* isolateMessageParameters(char* message){
+	message[strlen(message) - 1] = '\0';
+	return message + 4;
+}
+
+void parseZoneMode(char *msg,int nbPoints, Coordinate *coordinates)
+{
+	char *token = NULL;
+	uint8_t itemCounter=0;
+	//bool isEven=false;
+	bool isEven=false;
+	//initialisation des coordonnées
+	for(uint8_t i=0;i<nbPoints;i++)
+	{
+		coordinates[i].lat=0.0;
+		coordinates[i].lon=0.0;
+	}
+	
+	//Parsage du message contenant uniquement "lat 1:lon 1;...;lat n:lon n" et stockage des valeurs dans la structure Coordinate
+	for (token = strtok(msg, ":;"); token != NULL; token = strtok(NULL, ":;"))
+	{
+		if(isEven)
+		{
+			coordinates[itemCounter].lon=strtod(token,NULL);
+			itemCounter++;
+			isEven=false;
+		}
+		else
+		{
+			coordinates[itemCounter].lat=strtod(token,NULL);
+			isEven=true;
+		}
+	}
+}
+
+/* Sets a fake predetermined config when reading HTTP data from the server.
+TODO : it's a debug function, it should not be in the final build */
+void statusManager_setTestLastParsedConfig()
+{
+	if(xSemaphoreTakeRecursive(_lastParsedConfigSemaphore, 1000) == pdPASS)
+	{
+		#if (TEST_FAKE_DONT_MOVE==1)
+		_lastParsedConfig.modeStatus.status= MODE_STATUS_DONT_MOVE;
+		_lastParsedConfig.modeStatus.state = DONT_MOVE_STATE_RAS;
+		_lastParsedConfig.modeParameters.refreshRate = 0;
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+		#elif (TEST_FAKE_ZONE==1)
+		_lastParsedConfig.modeStatus.status= MODE_STATUS_ZONE;
+		_lastParsedConfig.modeStatus.state = ZONE_STATE_RAS;
+		_lastParsedConfig.modeParameters.refreshRate = 0;
+		_lastParsedConfig.modeParameters.coordinates[0].lat = 45.165621502;
+		_lastParsedConfig.modeParameters.coordinates[0].lon = -1.465729661;
+		_lastParsedConfig.modeParameters.coordinates[1].lat = 43.165324137;
+		_lastParsedConfig.modeParameters.coordinates[1].lon = -1.465761848;
+		_lastParsedConfig.modeParameters.coordinates[2].lat = 43.16547013;
+		_lastParsedConfig.modeParameters.coordinates[2].lon = -1.465044692;
+		_lastParsedConfig.modeParameters.coordinates[3].lat = 43.165793661;
+		_lastParsedConfig.modeParameters.coordinates[3].lon = -1.465205625;
+		_lastParsedConfig.modeParameters.coordinates[4].lat = 45.165621502;
+		_lastParsedConfig.modeParameters.coordinates[4].lon = -1.465729661;
+		_lastParsedConfig.modeParameters.nbCoordinates = 5;
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+		#elif (TEST_FAKE_TRACKING==1)
+		_lastParsedConfig.modeStatus.status= MODE_STATUS_TRACKING;
+		_lastParsedConfig.modeStatus.state = 0;
+		_lastParsedConfig.modeParameters.refreshRate = 30;
+		maskUtilities_setRequestMaskBits(REQUEST_BIT_START_MODE_FROM_LPC);
+		#endif
+		xSemaphoreGiveRecursive(_lastParsedConfigSemaphore);
+	}
+}
+
+/*
+Construit les paramètre avec le message de changement de statut
+*/
+static void buildLastParsedParameters(char *parameterStr, E_MODE_STATUS status){
+
+	uint32_t idMode = 0;
+	char* idModeString = strtok(parameterStr, ";");
+	_lastParsedConfig.modeParameters.modeID = atoi(idModeString);
+	parameterStr = parameterStr + strlen(idModeString)+2; // Go past mode ID and the null terminating char
+	if(status == MODE_STATUS_TRACKING
+	|| status == MODE_STATUS_DONT_MOVE)
+	{
+		_lastParsedConfig.modeParameters.refreshRate = atoi(parameterStr);
+	}
+	else if(status == MODE_STATUS_ZONE)
+	{
+		uint8_t pointsCounter=0;
+		_lastParsedConfig.modeStatus.status= MODE_STATUS_ZONE;
+		char* parameter = strtok(parameterStr, ";");
+		if(parameter == NULL) return;
+		_lastParsedConfig.modeParameters.refreshRate = atoi(parameter);
+		parameterStr += strlen(parameter)+1;
+
+		for (uint16_t i = 0; i < GSM_BUF_SIZE; i++)
+		{
+			if(parameterStr[i]==':')
+			{
+				pointsCounter++;
+			}
+		}
+		_lastParsedConfig.modeParameters.nbCoordinates=pointsCounter;
+		_lastParsedConfig.modeStatus.state = 0;
+		parseZoneMode(parameterStr,_lastParsedConfig.modeParameters.nbCoordinates,_lastParsedConfig.modeParameters.coordinates);
+	}
+}
+
+/*
+Checks the rightness of the format of a message : #D...&
+- at least 3 chars
+- starting by #D, finishing by &
+*/
+bool statusManager_isDateConfigMessage(char* message){
+	int msglength = strlen(message);
+	if(msglength < 3){
+		return false;
+	}
+	if(message[0] != '#'
+	|| message[1] != 'D'
+	|| message[msglength-1] != '&'){
+		return false;
+	}
+	
+	return true;
+}
+
+/*
+Checks the rightness of the format of a message : #M0X...&
+- at least 5 chars
+- starting by #MXX where XX is a number with max 2 chars (01, 02, 12, 99...), finishing by &
+TODO : check that XX is a number within the right boundaries.
+*/
+bool statusManager_isModeMessage(char* message){
+	int msglength = strlen(message);
+	if(msglength < 5){
+		return false;
+	}
+	if(message[0] != '#'
+	|| message[1] != 'M'
+	|| message[msglength-1] != '&'){
+		return false;
+	}
+	
+	return true;
+}
+
+/*
+Checks the rightness of the format of a message : #S0X...&
+- at least 5 chars
+- starting by #SXX where XX is a number with max 2 chars (01, 02, 12, 99...), finishing by &
+TODO : check that XX is a number within the right boundaries.
+*/
+bool statusManager_isStateChangeMessage(char* message){
+	int msglength = strlen(message);
+	if(msglength < 5){
+		return false;
+	}
+	if(message[0] != '#'
+	|| message[1] != 'S'
+	|| message[msglength-1] != '&'){
+		return false;
+	}
+	
+	return true;
+}
+
+/*
+Checks the rightness of the format of a message : #PX...&
+- at least 4 chars
+- starting by #PX where X is a number between 0 or 1, finishing by &
+TODO : check that X is a number within the right boundaries.
+*/
+bool statusManager_isPowerSavingConfigurationMessage(char* message){
+	int msglength = strlen(message);
+	if(msglength < 4){
+		return false;
+	}
+	if(message[0] != '#'
+	|| message[1] != 'P'
+	|| message[msglength-1] != '&'){
+		return false;
+	}
+	
+	return true;
+}
+
+char* statusManager_getCurrentStatusString(char* statusBuff){
+	switch(_runningConfig.modeStatus.status){
+		case MODE_STATUS_DONT_MOVE     : strcpy(statusBuff, "[  DONT_MOVE   ] "); break;
+		case MODE_STATUS_NONE          : strcpy(statusBuff, "[     NONE     ] ");	break;
+		case MODE_STATUS_ON_DEMAND     : strcpy(statusBuff, "[  ON_DEMAND   ] ");	break;
+		case MODE_STATUS_TRACKING      : strcpy(statusBuff, "[   TRACKING   ] ");	break;
+		case MODE_STATUS_WAITING       : strcpy(statusBuff, "[   WAITING    ] ");	break;
+		case MODE_STATUS_ZONE          : strcpy(statusBuff, "[    ZONE      ] ");	break;
+		case MODE_STATUS_SOS			  : strcpy(statusBuff, "[     SOS      ] "); break;
+	}
+	return statusBuff;
+}
+
+/* Checks if the message is of Admin type 
+Admin type message : #AXX& where XX is a 2 digits number*/
+bool statusManager_isAdminMessage(const char* message){
+	int msglength = strlen(message);
+	if(msglength < 5){
+		return false;
+	}
+	if(message[0] != '#'
+	|| message[1] != 'A'
+	|| message[msglength-1] != '&'){
+		return false;
+	}
+	
+	return true;
+}
+
+bool statusManager_isFunctionalityMessage(const char* message)
+{
+	int msglength = strlen(message);
+	if(msglength < 5){
+  		return false;
+	}
+	if(message[0] != '#'
+	|| message[1] != 'F'
+	|| message[msglength-1] != '&'){
+  		return false;
+	}
+	
+	return true;
+}
+
+void statusManager_parseFunctionalityMessage(const char* message)
+{
+	char msgNumStr[3];
+	msgNumStr[0] = message[2];
+	msgNumStr[1] = message[3];
+	msgNumStr[2] = 0;
+	uint8_t msgNum = atoi(msgNumStr);
+
+	switch(msgNum){
+  		case 1: // battery refresh message
+  			// the handle of this message is actually already handled : the getSeekiosInstruction answers directly to the battery update request
+  			break;
+  		default:
+  			break;
+	}
+}

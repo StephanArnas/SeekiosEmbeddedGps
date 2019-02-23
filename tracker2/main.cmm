@@ -1,0 +1,395 @@
+#include "atmel_start.h"
+#include "atmel_start_pins.h"
+#include "usb_main.h"
+#include "ble_config.h"
+#include "sleep_manager_main.h"
+#include "sgs/helper_sgs.h"
+#include "hal_usart_async.h"
+
+volatile uint8_t SER3_DEBUG_buf[48] = "Hello!";
+
+static void tx_cb_SER3_DEBUG(
+		const struct usart_async_descriptor *const io_descr)
+{
+	/* Transfer completed */
+}
+
+void SER3_DEBUG_print(void)
+{
+	struct io_descriptor *io;
+
+	usart_async_register_callback(&SER3_DEBUG,
+			USART_ASYNC_TXC_CB,
+			tx_cb_SER3_DEBUG);
+	/*usart_async_register_callback(&SER3_DEBUG, USART_ASYNC_RXC_CB, rx_cb);
+	   usart_async_register_callback(&SER3_DEBUG, USART_ASYNC_ERROR_CB, err_cb);*/
+	usart_async_get_io_descriptor(&SER3_DEBUG, &io);
+	usart_async_enable(&SER3_DEBUG);
+
+	io_write(io, SER3_DEBUG_buf, 48);
+}
+
+
+#define LED						PIN_PA16
+#define BUTTON					PIN_PA13  //SW0_PIN
+#define GPIO_BUTTON_PIN_MASK   (1U << (BUTTON & 0x1F))
+
+
+void RTC_Start( void )
+{
+    // $$$ Code to init the RTC.
+  //clock for RTC : Xosc32k    
+    OSC32KCTRL->RTCCTRL.bit.RTCSEL = OSC32KCTRL_RTCCTRL_RTCSEL(OSC32KCTRL_RTCCTRL_RTCSEL_XOSC32K_Val);
+
+    RTC->MODE0.CTRLA.bit.SWRST=1;
+    while(RTC->MODE0.SYNCBUSY.bit.SWRST>0);
+
+    RTC->MODE0.INTENSET.reg = RTC_MODE0_INTENCLR_CMP0;
+
+    RTC->MODE0.COMP[0].reg = 32768;
+	
+    while(RTC->MODE0.SYNCBUSY.bit.COMP0>0);
+
+    //Mode 0
+    RTC->MODE0.CTRLA.reg = RTC_MODE0_CTRLA_MODE(0)|RTC_MODE0_CTRLA_PRESCALER(RTC_MODE0_CTRLA_PRESCALER_DIV1_Val);
+    RTC->MODE0.CTRLA.reg = RTC_MODE0_CTRLA_ENABLE|RTC_MODE0_CTRLA_MATCHCLR|RTC_MODE0_CTRLA_MODE(0)|RTC_MODE0_CTRLA_PRESCALER(RTC_MODE0_CTRLA_PRESCALER_DIV1_Val);
+    while(RTC->MODE0.SYNCBUSY.bit.ENABLE>0);
+}
+
+//Initialise BOD33 in sampling mode for RUN and STANDBY
+//Threshold is set at approximately 
+void BOD_init_sampled(void)
+{       
+    while(SUPC->STATUS.bit.B33SRDY==0);
+    SUPC->BOD33.reg = SUPC_BOD33_HYST | SUPC_BOD33_ACTION_INT | SUPC_BOD33_RUNSTDBY | SUPC_BOD33_LEVEL(30) | SUPC_BOD33_PSEL_DIV2;
+    while(SUPC->STATUS.bit.B33SRDY==0);
+    SUPC->BOD33.reg = SUPC_BOD33_HYST | SUPC_BOD33_ACTION_INT | SUPC_BOD33_RUNSTDBY | SUPC_BOD33_LEVEL(30) | SUPC_BOD33_PSEL_DIV2  | SUPC_BOD33_STDBYCFG;
+    while(SUPC->STATUS.bit.B33SRDY==0);
+    SUPC->BOD33.reg = SUPC_BOD33_ENABLE | SUPC_BOD33_HYST | SUPC_BOD33_ACTION_INT | SUPC_BOD33_RUNSTDBY | SUPC_BOD33_LEVEL(30) | SUPC_BOD33_PSEL_DIV2 | SUPC_BOD33_STDBYCFG;
+    while(SUPC->STATUS.bit.B33SRDY==0);
+    //RevA1 errata ref #13918 workaround below
+    SUPC->INTFLAG.reg = SUPC_INTFLAG_BOD33DET;
+    SUPC->BOD33.reg = SUPC_BOD33_ENABLE | SUPC_BOD33_HYST | SUPC_BOD33_ACTION_RESET | SUPC_BOD33_RUNSTDBY | SUPC_BOD33_LEVEL(30) | SUPC_BOD33_PSEL_DIV2 | SUPC_BOD33_STDBYCFG| SUPC_BOD33_ACTCFG;
+    while(SUPC->STATUS.bit.B33SRDY==0);
+}
+
+void hardware_setup_part1( void )
+{
+//     PORT->Group[1].DIR.reg |= (1<<0); //PB00 is an output
+//     PORT->Group[1].DIR.reg |= (1<<1); //PB01 is an output    
+//   
+    //Enable XOSC32K (for RTC)
+    OSC32KCTRL->XOSC32K.reg = OSC32KCTRL_XOSC32K_ENABLE | OSC32KCTRL_XOSC32K_XTALEN|\
+            OSC32KCTRL_XOSC32K_EN32K|\
+            OSC32KCTRL_XOSC32K_RUNSTDBY | OSC32KCTRL_XOSC32K_STARTUP(4);
+    while(OSC32KCTRL->STATUS.bit.XOSC32KRDY==0);
+    
+// $$$ init device phase 1 (device specific startup)
+    RTC_Start();
+
+    //Running at 12MHz in PL0, requires 1 waistate on flash
+     NVMCTRL->CTRLB.bit.RWS = 2;
+//     
+//     //Use xMHz system clock
+     OSCCTRL->OSC16MCTRL.bit.FSEL= 0x00;
+ 	MCLK->BUPDIV.reg = 0x80;
+ 	MCLK->LPDIV.reg = 0x40;
+ 	MCLK->CPUDIV.reg = 0x01;
+	//set sleepmode
+	PM->SLEEPCFG.reg = 0x4;
+	//PM->SLEEPCFG.bit.SLEEPMODE=BACKUP;
+	/*sleep(2);*/
+	
+
+      
+    //Workaround for errata #13674
+    SUPC->VREF.reg |= 1<<8;
+    
+    //nLDO/Buck : Select Buck
+    SUPC->VREG.bit.SEL = 1;
+    while(SUPC->STATUS.bit.VREGRDY==0);
+    
+    //Use BOD for voltage integrity
+     BOD_init_sampled();
+    
+    //Enable RTC interrupts
+      NVIC_ClearPendingIRQ(RTC_IRQn);
+      NVIC_SetPriority(RTC_IRQn, 3);
+      NVIC_EnableIRQ(RTC_IRQn);
+
+    // global interrupt enable
+      //cpu_irq_enable();    
+}
+
+
+
+
+
+
+
+
+volatile uint32_t val1, val2, val3, val4;
+int init_pins(void)
+{
+volatile PortGroup *button_port = (volatile PortGroup *)(&(PORT->Group[BUTTON / 32]));
+volatile bool boot_en;
+
+/* Enable the input mode in Boot GPIO Pin */
+button_port->DIRCLR.reg = GPIO_BUTTON_PIN_MASK;
+button_port->PINCFG[BUTTON & 0x1F].reg = PORT_PINCFG_INEN | PORT_PINCFG_PULLEN;
+button_port->OUTSET.reg = GPIO_BUTTON_PIN_MASK;
+/* Read the BUTTON status */
+boot_en = (button_port->IN.reg) & GPIO_BUTTON_PIN_MASK;
+
+//volatile uint32_t val1, val2, val3, val4;
+uint32_t *ptr1 = (volatile uint32_t *)0x40002800;    //Adresse des Ports, fyi
+val1 = *ptr1;
+
+val2= PORT->Group[0].IN.bit.IN & (1 << 13);  //Check PA13
+
+
+
+/* PA03: input with pullup */
+PORT->Group[0].PINCFG[3].bit.INEN = 1;
+PORT->Group[0].PINCFG[3].bit.PULLEN = 1;
+PORT->Group[0].OUTCLR.bit.OUTCLR = (1 << 3);
+val4= PORT->Group[0].IN.bit.IN ; //Check 
+
+val3= PORT->Group[0].IN.bit.IN & (1 << 03);  //Check PA02 VUSB
+/* Check the bootloader enable condition */
+
+// config LED PA14
+PORT->Group[0].DIRSET.reg =  (1 << 14);
+PORT->Group[0].OUTCLR.reg = (1 << 14);
+PORT->Group[0].PINCFG[14].bit.PMUXEN = 0;
+
+
+// config LED PA15
+PORT->Group[0].DIRSET.reg =  (1 << 15);
+PORT->Group[0].OUTCLR.reg = (1 << 15);
+PORT->Group[0].PINCFG[15].bit.PMUXEN = 0;
+
+// config Pins BLE (PB06, PB07) 
+//PB06 BT_enable  > low off
+//BT_wakeup       > low off??
+PORT->Group[1].DIRSET.reg =  (1 << 6);
+PORT->Group[1].OUTCLR.reg = (1 << 6);
+//PORT->Group[1].OUTSET.reg = (1 << 6);
+PORT->Group[1].PINCFG[6].bit.PMUXEN = 0;
+
+PORT->Group[1].DIRSET.reg =  (1 << 7);
+PORT->Group[1].OUTCLR.reg = (1 << 7);
+PORT->Group[1].PINCFG[7].bit.PMUXEN = 0;
+
+// config Pins GSM/GPS (PB10 - PB13)
+//PB10 power enable > low off or floating
+//PB11 GSMpower key > low 
+//PB12 GSM DTR      > low 
+//PB13 GPS power enable > low off or floating
+
+
+PORT->Group[1].DIRSET.reg =  (1 << 10);
+PORT->Group[1].OUTCLR.reg = (1 << 10);
+PORT->Group[1].PINCFG[10].bit.PMUXEN = 0;
+
+PORT->Group[1].DIRSET.reg =  (1 << 11);
+PORT->Group[1].OUTCLR.reg = (1 << 11);
+PORT->Group[1].PINCFG[11].bit.PMUXEN = 0;
+
+PORT->Group[1].DIRSET.reg =  (1 << 12);
+PORT->Group[1].OUTCLR.reg = (1 << 12);
+PORT->Group[1].PINCFG[12].bit.PMUXEN = 0;
+
+PORT->Group[1].DIRSET.reg =  (1 << 13);
+PORT->Group[1].OUTCLR.reg = (1 << 13);
+PORT->Group[1].PINCFG[13].bit.PMUXEN = 0;
+
+//PA17 GSM TX                            Controller RX  macht probleme wenn floating (schwingt, stromverbrauch)
+//PA21 DEBUG TX                                macht probleme wenn floating
+//PA09 GSM TX                                    hat nichts gebracht, lassen wir aber mal besser
+//PB08 BT TX
+//PA05 BT2TX
+
+// 
+// PORT->Group[0].PINCFG[17].bit.INEN = 1;  // as input
+// PORT->Group[0].PINCFG[17].bit.PULLEN = 1; //with pullup
+// PORT->Group[0].OUTCLR.bit.OUTCLR = (1 << 17);
+// 
+//  PORT->Group[0].PINCFG[21].bit.INEN = 0;  // as input
+//  PORT->Group[0].PINCFG[21].bit.PULLEN = 0; //with pullup
+//  PORT->Group[0].OUTCLR.bit.OUTCLR = (1 << 21); //lösche outset und mach dadurch einen inp// 
+
+// PORT->Group[0].PINCFG[9].bit.INEN = 1;  // as input
+// PORT->Group[0].PINCFG[9].bit.PULLEN = 1; //with pullup
+// PORT->Group[0].OUTCLR.bit.OUTCLR = (1 << 9);
+// 
+// PORT->Group[1].PINCFG[8].bit.INEN = 1;  // as input
+// PORT->Group[1].PINCFG[8].bit.PULLEN = 1; //with pullup
+// PORT->Group[1].OUTCLR.bit.OUTCLR = (1 << 8);
+// 
+// PORT->Group[0].PINCFG[5].bit.INEN = 1;  // as input
+// PORT->Group[0].PINCFG[5].bit.PULLEN = 1; //with pullup
+// PORT->Group[0].OUTCLR.bit.OUTCLR = (1 << 5);
+
+// config Pins SPI-Dataflash (PB10 - PB13)  checked!
+
+// PORT->Group[1].DIRSET.reg =  (1 << 30);
+// PORT->Group[1].OUTSET.reg = (1 << 30);
+// PORT->Group[1].PINCFG[30].bit.PMUXEN = 0;
+// 
+// PORT->Group[1].DIRSET.reg =  (1 << 31);
+// PORT->Group[1].OUTSET.reg = (1 << 31);
+// PORT->Group[1].PINCFG[31].bit.PMUXEN = 0;
+// // set the clock of dataflash, if not used
+// /* PA20: input with pullup */
+// PORT->Group[1].PINCFG[3].bit.INEN = 1;
+// PORT->Group[1].PINCFG[3].bit.PULLEN = 1;
+// PORT->Group[1].PINCFG[3].bit.PMUXEN = 0;
+// 
+// PORT->Group[1].PINCFG[0].bit.INEN = 1;
+// PORT->Group[1].PINCFG[0].bit.PULLEN = 1;
+// PORT->Group[1].PINCFG[0].bit.PMUXEN = 0;
+// 
+// PORT->Group[1].PINCFG[1].bit.INEN = 1;
+// PORT->Group[1].PINCFG[1].bit.PULLEN = 1;
+// PORT->Group[1].PINCFG[1].bit.PMUXEN = 0;
+
+
+
+// config LED PA16
+PORT->Group[0].DIRSET.reg =  (1 << 16);
+PORT->Group[0].OUTCLR.reg = (1 << 16);
+PORT->Group[0].PINCFG[16].bit.PMUXEN = 0;
+
+
+
+
+
+
+
+
+
+
+
+
+// delay_ms(4000);
+//  PORT->Group[0].OUTTGL.reg = (1 << 16);
+//  delay_ms(4000);
+
+ 
+}
+
+
+
+volatile uint32_t RTC_count;
+
+void RTC_Handler(void)
+{
+	NVIC_DisableIRQ(RTC_IRQn);
+
+  /*  volatile uint32_t i,jj;*/
+    RTC->MODE0.INTFLAG.reg = RTC_MODE0_INTFLAG_CMP0;
+   
+//delay_us(4);
+      
+	  NVIC_ClearPendingIRQ(RTC_IRQn);
+ RTC_count = RTC_count + 1;
+// PORT->Group[0].OUTTGL.reg = (1 << 14);
+    //tesTimerInterrupt();
+	 NVIC_EnableIRQ(RTC_IRQn);	
+	
+}
+
+
+
+
+int main(void)
+{
+	system_init();
+	 serial_io_init();
+	 hardware_setup_part1();	 
+	 //hri_sercomspi_set_CTRLA_ENABLE_bit(hw);
+	//_init_chip();
+SUPC->VREG.bit.SEL = 1;  // switch to buck regulator	
+	//
+	 sprintf(buf_mad,"Power down\n\r\0");
+	 send_debug(buf_mad);
+	hardware_setup_part1();
+	DF_PowerDown();
+	
+	delay_ms(10);
+	bma222_sleep(1);
+ 	delay_ms(1000);
+ 	 sprintf(buf_mad,"Power up\n\r\0");
+ 	 send_debug(buf_mad);
+	 	
+
+
+  df_read_status();
+  sprintf(buf_mad,"Power up\n\r\0");
+ 	DF_PowerUp();
+ 		 df_read_status();
+ 	delay_ms(1000);
+ 	 sprintf(buf_mad,"Power down\n\r\0");
+ 	 send_debug(buf_mad);
+ 	 df_read_status();
+     DF_PowerDown();
+	
+	
+	init_pins();
+	
+	SUPC->VREG.bit.SEL = 1;  // switch to buck regulator	
+	init_sgs();
+	
+	 DF_PowerDown();
+	 bma222_sleep(1);
+
+ sprintf(buf_mad,"all done\0\n\r");
+
+
+   uint32_t current_ts;
+   	struct calendar_date act_date;
+   	struct calendar_time act_time;
+		struct calendar_date date;
+		struct calendar_time time;
+	struct calendar_descriptor CALENDAR_;
+	
+	//Adresse des Systick-timers:
+	uint32_t *p_tic;
+	p_tic = 0xE000E018;  //Basisadresse
+	//p_tic += 0x18;
+	uint32_t mad_tic = *p_tic;
+	
+	
+
+//gpio_toggle_pin_level(GPS_power_enable);
+// 	/* Replace with your application code */
+ 	while(1) {
+ 	
+ 	
+	
+uint16_t buffer[2];
+ADC_read_BAT_USB(buffer);
+sprintf(buf_mad,"BAT:%i USB:%i -\n\r ", buffer[0], buffer[1]);//
+		  send_debug(buf_mad);
+ 
+ 
+ 		  delay_ms(20);
+// 		 NVIC_DisableIRQ(SERCOM0_IRQn);
+// 		 NVIC_DisableIRQ(SERCOM1_IRQn);
+// 		 NVIC_DisableIRQ(SERCOM2_IRQn);
+// 		 NVIC_DisableIRQ(SERCOM3_IRQn);
+// 		 NVIC_DisableIRQ(SERCOM4_IRQn);
+// 		 NVIC_DisableIRQ(SERCOM5_IRQn);
+		  NVIC_ClearPendingIRQ(SERCOM0_IRQn);
+		  NVIC_ClearPendingIRQ(SERCOM1_IRQn);
+		  NVIC_ClearPendingIRQ(SERCOM2_IRQn);
+		  NVIC_ClearPendingIRQ(SERCOM3_IRQn);
+		  NVIC_ClearPendingIRQ(SERCOM4_IRQn);
+		  NVIC_ClearPendingIRQ(SERCOM5_IRQn);
+	
+
+		_go_to_sleep();
+
+	}
+}

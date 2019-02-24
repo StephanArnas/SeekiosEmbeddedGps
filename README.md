@@ -14,4 +14,4 @@ The core features of the Seekios Embedded Gps are :
   <li>Send an SOS by pressing a button</li>
   <li>Send notification when battery is critical</li>
 </ul>
-<p>Have a look <a href="https://github.com/StephanArnas/SeekiosWebApi" target="_blank">here</a> to check the list of endpoints the seekios required.</p>
+<p>Have a look <a target="_blank" href="https://github.com/StephanArnas/SeekiosWebApi">here</a> to check the list of endpoints the seekios required.</p>

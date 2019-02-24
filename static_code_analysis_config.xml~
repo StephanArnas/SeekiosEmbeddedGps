@@ -1,8 +1,0 @@
-<?xml version="1.0" ?>
-<def>
-	<resource>
-		<alloc>pvPortMalloc</alloc>
-		<dealloc>vPortFree</dealloc>
-	</resource>
-</def>
-
